@@ -14,27 +14,44 @@ type CrawlResult = {
   url: string;
   status: "queued" | "crawling" | "checked" | "broken";
   redirectUrl?: string;
-  source?: string; // Which page found this link?
+  source?: string;
 };
 
 export default function CrawlerPage() {
   // CONFIG
   const [startUrl, setStartUrl] = useState("https://coloringonly.com");
-  const [maxPages, setMaxPages] = useState(1000); // Safety limit
+  const [maxPages, setMaxPages] = useState(1000);
 
   // STATE
-  const [results, setResults] = useState<Map<string, CrawlResult>>(new Map());
+  const resultsRef = useRef<Map<string, CrawlResult>>(new Map());
+  const [resultsMap, setResultsMap] = useState<Map<string, CrawlResult>>(new Map());
+
   const [queue, setQueue] = useState<string[]>([]);
   const [isCrawling, setIsCrawling] = useState(false);
   const [processedCount, setProcessedCount] = useState(0);
 
-  // REFS (For mutable state in loops)
   const shouldStop = useRef(false);
+
+  // 🛡️ THE SAFETY GUARD: Tracks every URL we have ever queued
   const visitedRef = useRef<Set<string>>(new Set());
 
   // STATS
-  const brokenLinks = Array.from(results.values()).filter((r) => r.status === "broken");
-  const progress = (processedCount / (processedCount + queue.length || 1)) * 100;
+  const brokenLinks = Array.from(resultsMap.values()).filter((r) => r.status === "broken");
+
+  // ==============================
+  // 🛠️ HELPER: NORMALIZE URL
+  // ==============================
+  // This prevents duplicates like "site.com/a" and "site.com/a/"
+  const normalizeUrl = (urlStr: string) => {
+    try {
+      const u = new URL(urlStr);
+      // Remove trailing slash and lower case for comparison
+      const cleanPath = u.pathname.replace(/\/+$/, "");
+      return (u.origin + cleanPath + u.search).toLowerCase();
+    } catch (e) {
+      return urlStr.toLowerCase();
+    }
+  };
 
   // ==============================
   // 🕷️ CRAWLER LOGIC
@@ -45,21 +62,27 @@ export default function CrawlerPage() {
     // Reset
     shouldStop.current = false;
     visitedRef.current = new Set();
-    visitedRef.current.add(startUrl);
+    resultsRef.current = new Map();
+
+    // Normalize Start URL
+    const normStart = normalizeUrl(startUrl);
+
+    // Add Start URL to Guards
+    visitedRef.current.add(normStart);
+    resultsRef.current.set(normStart, { url: startUrl, status: "queued", source: "Start" });
 
     setQueue([startUrl]);
-    setResults(new Map([[startUrl, { url: startUrl, status: "queued", source: "Start" }]]));
+    setResultsMap(new Map(resultsRef.current));
     setProcessedCount(0);
     setIsCrawling(true);
 
-    // Initial Kickoff
     processQueue([startUrl]);
   };
 
   const processQueue = async (initialQueue: string[]) => {
     let currentQueue = [...initialQueue];
+    const BATCH_SIZE = 5;
 
-    // We run a loop as long as there are items and we haven't stopped
     while (currentQueue.length > 0 && !shouldStop.current) {
       // Safety Break
       if (visitedRef.current.size > maxPages) {
@@ -68,89 +91,100 @@ export default function CrawlerPage() {
         break;
       }
 
-      // 1. Take the next URL
-      const currentUrl = currentQueue.shift();
-      if (!currentUrl) break;
+      // 1. Take a Batch
+      const batch = currentQueue.splice(0, BATCH_SIZE);
 
-      // Update UI to show we are working on this one
-      updateResult(currentUrl, { status: "crawling" });
+      // Update UI Status
+      batch.forEach((url) => {
+        const norm = normalizeUrl(url);
+        updateResultRef(norm, { status: "crawling" });
+      });
+      syncState();
 
-      try {
-        // ==========================
-        // STEP A: CHECK THE LINK (Is it broken?)
-        // ==========================
-        const checkRes = await fetch("/api/check", {
-          method: "POST",
-          body: JSON.stringify({ url: currentUrl }),
-        });
-        const checkData = await checkRes.json();
+      // 2. Process Batch in Parallel
+      const newLinksFound: string[] = [];
 
-        if (checkData.isBroken) {
-          // If broken (or redirects home), mark it and DO NOT crawl deeper
-          updateResult(currentUrl, {
-            status: "broken",
-            redirectUrl: checkData.finalUrl,
-          });
-        } else {
-          // If valid, mark checked
-          updateResult(currentUrl, {
-            status: "checked",
-            redirectUrl: checkData.finalUrl,
-          });
+      await Promise.all(
+        batch.map(async (currentUrl) => {
+          const normCurrent = normalizeUrl(currentUrl);
 
-          // ==========================
-          // STEP B: SCRAPE FOR MORE LINKS (Recursion)
-          //Only crawl if it's the same domain to prevent leaving the site
-          // ==========================
-          const scrapeRes = await fetch("/api/scrape", {
-            method: "POST",
-            body: JSON.stringify({ url: currentUrl }),
-          });
-          const scrapeData = await scrapeRes.json();
+          try {
+            // A. CHECK LINK
+            const checkRes = await fetch("/api/check", {
+              method: "POST",
+              body: JSON.stringify({ url: currentUrl }),
+            });
+            const checkData = await checkRes.json();
 
-          if (scrapeData.success && scrapeData.links.length > 0) {
-            const newLinks: string[] = [];
+            if (checkData.isBroken) {
+              updateResultRef(normCurrent, { status: "broken", redirectUrl: checkData.finalUrl });
+              // 🛑 If broken, we do NOT scrape it for more links
+            } else {
+              updateResultRef(normCurrent, { status: "checked", redirectUrl: checkData.finalUrl });
 
-            scrapeData.links.forEach((link: string) => {
-              // Only add if we haven't seen it yet
-              if (!visitedRef.current.has(link)) {
-                visitedRef.current.add(link);
-                newLinks.push(link);
+              // B. SCRAPE (Only if valid)
+              const scrapeRes = await fetch("/api/scrape", {
+                method: "POST",
+                body: JSON.stringify({ url: currentUrl }),
+              });
+              const scrapeData = await scrapeRes.json();
 
-                // Add to results map so it shows in UI
-                setResults((prev) => {
-                  const next = new Map(prev);
-                  next.set(link, { url: link, status: "queued", source: currentUrl });
-                  return next;
+              if (scrapeData.success && scrapeData.links.length > 0) {
+                // 🛡️ CRITICAL LOOP PREVENTION HERE 🛡️
+                scrapeData.links.forEach((rawLink: string) => {
+                  const normLink = normalizeUrl(rawLink);
+
+                  // 1. CHECK IF VISITED
+                  if (!visitedRef.current.has(normLink)) {
+                    // 2. MARK AS VISITED IMMEDIATELY
+                    visitedRef.current.add(normLink);
+
+                    // 3. ADD TO NEXT QUEUE
+                    newLinksFound.push(rawLink);
+
+                    // 4. ADD TO UI MAP
+                    resultsRef.current.set(normLink, {
+                      url: rawLink,
+                      status: "queued",
+                      source: currentUrl,
+                    });
+                  }
                 });
               }
-            });
-
-            // Add new links to the END of the queue (BFS - Breadth First Search)
-            currentQueue.push(...newLinks);
-            setQueue([...currentQueue]); // Update UI counter
+            }
+          } catch (e) {
+            updateResultRef(normCurrent, { status: "broken", redirectUrl: "Network Error" });
           }
-        }
-      } catch (e) {
-        updateResult(currentUrl, { status: "broken", redirectUrl: "Network Error" });
+        })
+      );
+
+      // 3. Add new unique links to queue
+      if (newLinksFound.length > 0) {
+        currentQueue.push(...newLinksFound);
       }
 
-      setProcessedCount((prev) => prev + 1);
+      // 4. Update UI
+      setQueue([...currentQueue]);
+      setProcessedCount((prev) => prev + batch.length);
+      syncState();
 
-      // 🛑 SPEED CONTROL: Wait 500ms between requests to be nice to the server
-      await new Promise((r) => setTimeout(r, 500));
+      // Tiny delay
+      await new Promise((r) => setTimeout(r, 100));
     }
 
     setIsCrawling(false);
   };
 
-  const updateResult = (url: string, updates: Partial<CrawlResult>) => {
-    setResults((prev) => {
-      const next = new Map(prev);
-      const existing = next.get(url) || { url, status: "queued" };
-      next.set(url, { ...existing, ...updates });
-      return next;
-    });
+  const updateResultRef = (normUrl: string, updates: Partial<CrawlResult>) => {
+    // We use the normalized URL as the Key to prevent duplicates in the Map
+    const existing = resultsRef.current.get(normUrl);
+    if (existing) {
+      resultsRef.current.set(normUrl, { ...existing, ...updates });
+    }
+  };
+
+  const syncState = () => {
+    setResultsMap(new Map(resultsRef.current));
   };
 
   const stopCrawl = () => {
@@ -206,7 +240,8 @@ export default function CrawlerPage() {
             <Button
               variant="outline"
               onClick={() => {
-                setResults(new Map());
+                resultsRef.current = new Map();
+                setResultsMap(new Map());
                 setQueue([]);
                 setProcessedCount(0);
               }}
@@ -230,9 +265,9 @@ export default function CrawlerPage() {
         </Card>
       )}
 
-      {/* BROKEN LINKS SECTION (Main Focus) */}
+      {/* BROKEN LINKS SECTION */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* LEFT: Live Log (Optional, shows what is happening) */}
+        {/* LEFT: Live Log */}
         <Card className="lg:col-span-2 h-[600px] flex flex-col">
           <CardHeader className="pb-3">
             <CardTitle>Live Crawl Log</CardTitle>
@@ -246,8 +281,8 @@ export default function CrawlerPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {/* Show last 50 processed items first */}
-                {Array.from(results.values())
+                {/* Show last 50 processed items from STATE MAP */}
+                {Array.from(resultsMap.values())
                   .slice(-50)
                   .reverse()
                   .map((row) => (
