@@ -20,7 +20,7 @@ type CrawlResult = {
 export default function CrawlerPage() {
   // CONFIG
   const [startUrl, setStartUrl] = useState("https://coloringonly.com");
-  const [maxPages, setMaxPages] = useState(1000);
+  const [maxPages, setMaxPages] = useState(5000);
 
   // STATE
   const resultsRef = useRef<Map<string, CrawlResult>>(new Map());
@@ -31,8 +31,6 @@ export default function CrawlerPage() {
   const [processedCount, setProcessedCount] = useState(0);
 
   const shouldStop = useRef(false);
-
-  // 🛡️ THE SAFETY GUARD: Tracks every URL we have ever queued
   const visitedRef = useRef<Set<string>>(new Set());
 
   // STATS
@@ -41,11 +39,9 @@ export default function CrawlerPage() {
   // ==============================
   // 🛠️ HELPER: NORMALIZE URL
   // ==============================
-  // This prevents duplicates like "site.com/a" and "site.com/a/"
   const normalizeUrl = (urlStr: string) => {
     try {
       const u = new URL(urlStr);
-      // Remove trailing slash and lower case for comparison
       const cleanPath = u.pathname.replace(/\/+$/, "");
       return (u.origin + cleanPath + u.search).toLowerCase();
     } catch (e) {
@@ -59,15 +55,12 @@ export default function CrawlerPage() {
   const startCrawl = async () => {
     if (!startUrl) return alert("Enter a URL");
 
-    // Reset
     shouldStop.current = false;
     visitedRef.current = new Set();
     resultsRef.current = new Map();
 
-    // Normalize Start URL
     const normStart = normalizeUrl(startUrl);
 
-    // Add Start URL to Guards
     visitedRef.current.add(normStart);
     resultsRef.current.set(normStart, { url: startUrl, status: "queued", source: "Start" });
 
@@ -81,27 +74,23 @@ export default function CrawlerPage() {
 
   const processQueue = async (initialQueue: string[]) => {
     let currentQueue = [...initialQueue];
-    const BATCH_SIZE = 5;
+    const BATCH_SIZE = 10;
 
     while (currentQueue.length > 0 && !shouldStop.current) {
-      // Safety Break
       if (visitedRef.current.size > maxPages) {
         shouldStop.current = true;
         alert(`Reached limit of ${maxPages} pages. Stopping.`);
         break;
       }
 
-      // 1. Take a Batch
       const batch = currentQueue.splice(0, BATCH_SIZE);
 
-      // Update UI Status
       batch.forEach((url) => {
         const norm = normalizeUrl(url);
         updateResultRef(norm, { status: "crawling" });
       });
       syncState();
 
-      // 2. Process Batch in Parallel
       const newLinksFound: string[] = [];
 
       await Promise.all(
@@ -118,11 +107,10 @@ export default function CrawlerPage() {
 
             if (checkData.isBroken) {
               updateResultRef(normCurrent, { status: "broken", redirectUrl: checkData.finalUrl });
-              // 🛑 If broken, we do NOT scrape it for more links
             } else {
               updateResultRef(normCurrent, { status: "checked", redirectUrl: checkData.finalUrl });
 
-              // B. SCRAPE (Only if valid)
+              // B. SCRAPE
               const scrapeRes = await fetch("/api/scrape", {
                 method: "POST",
                 body: JSON.stringify({ url: currentUrl }),
@@ -130,19 +118,11 @@ export default function CrawlerPage() {
               const scrapeData = await scrapeRes.json();
 
               if (scrapeData.success && scrapeData.links.length > 0) {
-                // 🛡️ CRITICAL LOOP PREVENTION HERE 🛡️
                 scrapeData.links.forEach((rawLink: string) => {
                   const normLink = normalizeUrl(rawLink);
-
-                  // 1. CHECK IF VISITED
                   if (!visitedRef.current.has(normLink)) {
-                    // 2. MARK AS VISITED IMMEDIATELY
                     visitedRef.current.add(normLink);
-
-                    // 3. ADD TO NEXT QUEUE
                     newLinksFound.push(rawLink);
-
-                    // 4. ADD TO UI MAP
                     resultsRef.current.set(normLink, {
                       url: rawLink,
                       status: "queued",
@@ -158,25 +138,21 @@ export default function CrawlerPage() {
         })
       );
 
-      // 3. Add new unique links to queue
       if (newLinksFound.length > 0) {
         currentQueue.push(...newLinksFound);
       }
 
-      // 4. Update UI
       setQueue([...currentQueue]);
       setProcessedCount((prev) => prev + batch.length);
       syncState();
 
-      // Tiny delay
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 50));
     }
 
     setIsCrawling(false);
   };
 
   const updateResultRef = (normUrl: string, updates: Partial<CrawlResult>) => {
-    // We use the normalized URL as the Key to prevent duplicates in the Map
     const existing = resultsRef.current.get(normUrl);
     if (existing) {
       resultsRef.current.set(normUrl, { ...existing, ...updates });
@@ -190,6 +166,19 @@ export default function CrawlerPage() {
   const stopCrawl = () => {
     shouldStop.current = true;
     setIsCrawling(false);
+  };
+
+  // 📋 NEW EXPORT LOGIC
+  const handleCopyFullDetails = () => {
+    const exportData = brokenLinks.map((link) => ({
+      brokenLink: link.url,
+      redirectedTo: link.redirectUrl || "N/A",
+      foundOnPage: link.source || "Start",
+      status: link.status,
+    }));
+
+    navigator.clipboard.writeText(JSON.stringify(exportData, null, 2));
+    alert(`Copied full details for ${brokenLinks.length} links!`);
   };
 
   return (
@@ -322,9 +311,9 @@ export default function CrawlerPage() {
                 size="sm"
                 variant="outline"
                 className="h-8 bg-white text-red-700 border-red-200"
-                onClick={() => navigator.clipboard.writeText(brokenLinks.map((l) => l.url).join("\n"))}
+                onClick={handleCopyFullDetails} // 👈 UPDATED HANDLER HERE
               >
-                <Copy className="w-3 h-3" />
+                <Copy className="w-3 h-3 mr-2" /> Copy Full Report
               </Button>
             </CardTitle>
           </CardHeader>
