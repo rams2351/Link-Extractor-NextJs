@@ -46,7 +46,7 @@ export default function Crawler() {
   const visited = useRef<Set<string>>(new Set(["https://coloringonly.com/"]));
   const brokenLinks = useRef<BrokenReportItem[]>([]);
 
-  const MAX_CONCURRENCY = 5;
+  const MAX_CONCURRENCY = 10;
 
   const crawlStep = useCallback(async () => {
     if (queue.current.length === 0) {
