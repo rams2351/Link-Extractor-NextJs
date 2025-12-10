@@ -1,343 +1,334 @@
 "use client";
 
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Progress } from "@/components/ui/progress";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { AlertTriangle, Bug, CheckCircle2, Copy, Globe, Loader2, Play, StopCircle, Trash2 } from "lucide-react";
-import { useRef, useState } from "react";
+import axios from "axios";
+import { Activity, AlertTriangle, Download, Pause, Play, Save, Trash2, Upload } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
-// Data Structure
-type CrawlResult = {
+type LinkStatus = "ok" | "broken" | "soft-404" | "redirect" | "error";
+
+interface BrokenReportItem {
+  brokenLink: string;
+  redirectedTo: string | null;
+  foundOnPage: string;
+  status: LinkStatus;
+}
+
+interface QueueItem {
   url: string;
-  status: "queued" | "crawling" | "checked" | "broken";
-  redirectUrl?: string;
-  source?: string;
-};
+  parent: string;
+}
 
-export default function CrawlerPage() {
-  // CONFIG
-  const [startUrl, setStartUrl] = useState("https://coloringonly.com");
-  const [maxPages, setMaxPages] = useState(5000);
+interface CrawlerState {
+  queue: QueueItem[];
+  visited: string[];
+  brokenLinks: BrokenReportItem[];
+}
 
-  // STATE
-  const resultsRef = useRef<Map<string, CrawlResult>>(new Map());
-  const [resultsMap, setResultsMap] = useState<Map<string, CrawlResult>>(new Map());
+interface LiveScanItem {
+  url: string;
+  foundCount: number;
+  status: LinkStatus;
+}
 
-  const [queue, setQueue] = useState<string[]>([]);
-  const [isCrawling, setIsCrawling] = useState(false);
-  const [processedCount, setProcessedCount] = useState(0);
+export default function Crawler() {
+  const [isRunning, setIsRunning] = useState(false);
+  const [activeWorkers, setActiveWorkers] = useState(0);
+  const [liveFeed, setLiveFeed] = useState<LiveScanItem[]>([]);
 
-  const shouldStop = useRef(false);
-  const visitedRef = useRef<Set<string>>(new Set());
+  const [stats, setStats] = useState({
+    queued: 1,
+    visited: 0,
+    broken: 0,
+    soft404: 0,
+  });
 
-  // STATS
-  const brokenLinks = Array.from(resultsMap.values()).filter((r) => r.status === "broken");
+  const queue = useRef<QueueItem[]>([{ url: "https://coloringonly.com/", parent: "ROOT" }]);
+  const visited = useRef<Set<string>>(new Set(["https://coloringonly.com/"]));
+  const brokenLinks = useRef<BrokenReportItem[]>([]);
 
-  // ==============================
-  // 🛠️ HELPER: NORMALIZE URL
-  // ==============================
-  const normalizeUrl = (urlStr: string) => {
-    try {
-      const u = new URL(urlStr);
-      const cleanPath = u.pathname.replace(/\/+$/, "");
-      return (u.origin + cleanPath + u.search).toLowerCase();
-    } catch (e) {
-      return urlStr.toLowerCase();
+  const MAX_CONCURRENCY = 5;
+
+  const crawlStep = useCallback(async () => {
+    if (queue.current.length === 0) {
+      setIsRunning(false);
+      return;
     }
-  };
+    const currentItem = queue.current.shift();
+    if (!currentItem) return;
 
-  // ==============================
-  // 🕷️ CRAWLER LOGIC
-  // ==============================
-  const startCrawl = async () => {
-    if (!startUrl) return alert("Enter a URL");
+    try {
+      setActiveWorkers((prev) => prev + 1);
+      const { data } = await axios.post("/api/crawl", { url: currentItem.url });
 
-    shouldStop.current = false;
-    visitedRef.current = new Set();
-    resultsRef.current = new Map();
-
-    const normStart = normalizeUrl(startUrl);
-
-    visitedRef.current.add(normStart);
-    resultsRef.current.set(normStart, { url: startUrl, status: "queued", source: "Start" });
-
-    setQueue([startUrl]);
-    setResultsMap(new Map(resultsRef.current));
-    setProcessedCount(0);
-    setIsCrawling(true);
-
-    processQueue([startUrl]);
-  };
-
-  const processQueue = async (initialQueue: string[]) => {
-    let currentQueue = [...initialQueue];
-    const BATCH_SIZE = 10;
-
-    while (currentQueue.length > 0 && !shouldStop.current) {
-      if (visitedRef.current.size > maxPages) {
-        shouldStop.current = true;
-        alert(`Reached limit of ${maxPages} pages. Stopping.`);
-        break;
-      }
-
-      const batch = currentQueue.splice(0, BATCH_SIZE);
-
-      batch.forEach((url) => {
-        const norm = normalizeUrl(url);
-        updateResultRef(norm, { status: "crawling" });
-      });
-      syncState();
-
-      const newLinksFound: string[] = [];
-
-      await Promise.all(
-        batch.map(async (currentUrl) => {
-          const normCurrent = normalizeUrl(currentUrl);
-
-          try {
-            // A. CHECK LINK
-            const checkRes = await fetch("/api/check", {
-              method: "POST",
-              body: JSON.stringify({ url: currentUrl }),
-            });
-            const checkData = await checkRes.json();
-
-            if (checkData.isBroken) {
-              updateResultRef(normCurrent, { status: "broken", redirectUrl: checkData.finalUrl });
-            } else {
-              updateResultRef(normCurrent, { status: "checked", redirectUrl: checkData.finalUrl });
-
-              // B. SCRAPE
-              const scrapeRes = await fetch("/api/scrape", {
-                method: "POST",
-                body: JSON.stringify({ url: currentUrl }),
-              });
-              const scrapeData = await scrapeRes.json();
-
-              if (scrapeData.success && scrapeData.links.length > 0) {
-                scrapeData.links.forEach((rawLink: string) => {
-                  const normLink = normalizeUrl(rawLink);
-                  if (!visitedRef.current.has(normLink)) {
-                    visitedRef.current.add(normLink);
-                    newLinksFound.push(rawLink);
-                    resultsRef.current.set(normLink, {
-                      url: rawLink,
-                      status: "queued",
-                      source: currentUrl,
-                    });
-                  }
-                });
-              }
-            }
-          } catch (e) {
-            updateResultRef(normCurrent, { status: "broken", redirectUrl: "Network Error" });
-          }
-        })
+      setLiveFeed((prev) =>
+        [
+          {
+            url: currentItem.url,
+            foundCount: data.links?.length || 0,
+            status: data.status,
+          },
+          ...prev,
+        ].slice(0, 10)
       );
 
-      if (newLinksFound.length > 0) {
-        currentQueue.push(...newLinksFound);
+      if (data.status === "broken" || data.status === "soft-404" || data.status === "error") {
+        brokenLinks.current.push({
+          brokenLink: currentItem.url,
+          redirectedTo: data.redirectLocation || null,
+          foundOnPage: currentItem.parent,
+          status: data.status,
+        });
       }
 
-      setQueue([...currentQueue]);
-      setProcessedCount((prev) => prev + batch.length);
-      syncState();
+      if ((data.status === "ok" || data.status === "redirect") && !data.isLeaf) {
+        if (data.links && data.links.length > 0) {
+          data.links.forEach((link: string) => {
+            if (!visited.current.has(link)) {
+              visited.current.add(link);
+              queue.current.push({ url: link, parent: currentItem.url });
+            }
+          });
+        }
+      }
 
-      await new Promise((r) => setTimeout(r, 50));
+      setStats((prev) => ({
+        queued: queue.current.length,
+        visited: visited.current.size,
+        broken: brokenLinks.current.filter((l) => l.status === "broken" || l.status === "error").length,
+        soft404: brokenLinks.current.filter((l) => l.status === "soft-404").length,
+      }));
+    } catch (err) {
+      brokenLinks.current.push({
+        brokenLink: currentItem.url,
+        redirectedTo: null,
+        foundOnPage: currentItem.parent,
+        status: "error",
+      });
+    } finally {
+      setActiveWorkers((prev) => prev - 1);
     }
+  }, []);
 
-    setIsCrawling(false);
+  useEffect(() => {
+    if (!isRunning) return;
+    const timer = setInterval(() => {
+      if (activeWorkers < MAX_CONCURRENCY && queue.current.length > 0) {
+        crawlStep();
+      }
+    }, 50);
+    return () => clearInterval(timer);
+  }, [isRunning, activeWorkers, crawlStep]);
+
+  const downloadReport = () => {
+    const content = JSON.stringify(brokenLinks.current, null, 2);
+    const blob = new Blob([content], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `broken-links.json`;
+    document.body.appendChild(link);
+    link.click();
   };
 
-  const updateResultRef = (normUrl: string, updates: Partial<CrawlResult>) => {
-    const existing = resultsRef.current.get(normUrl);
-    if (existing) {
-      resultsRef.current.set(normUrl, { ...existing, ...updates });
-    }
+  const saveProgress = () => {
+    const state: CrawlerState = {
+      queue: queue.current,
+      visited: Array.from(visited.current),
+      brokenLinks: brokenLinks.current,
+    };
+    const blob = new Blob([JSON.stringify(state)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `crawler-state.json`;
+    document.body.appendChild(link);
+    link.click();
+    setIsRunning(false);
   };
 
-  const syncState = () => {
-    setResultsMap(new Map(resultsRef.current));
-  };
-
-  const stopCrawl = () => {
-    shouldStop.current = true;
-    setIsCrawling(false);
-  };
-
-  // 📋 NEW EXPORT LOGIC
-  const handleCopyFullDetails = () => {
-    const exportData = brokenLinks.map((link) => ({
-      brokenLink: link.url,
-      redirectedTo: link.redirectUrl || "N/A",
-      foundOnPage: link.source || "Start",
-      status: link.status,
-    }));
-
-    navigator.clipboard.writeText(JSON.stringify(exportData, null, 2));
-    alert(`Copied full details for ${brokenLinks.length} links!`);
+  const loadProgress = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const state = JSON.parse(ev.target?.result as string) as CrawlerState;
+        queue.current = state.queue;
+        visited.current = new Set(state.visited);
+        brokenLinks.current = state.brokenLinks;
+        setStats({
+          queued: state.queue.length,
+          visited: state.visited.length,
+          broken: state.brokenLinks.filter((l) => l.status !== "soft-404").length,
+          soft404: state.brokenLinks.filter((l) => l.status === "soft-404").length,
+        });
+        alert(`Loaded!`);
+      } catch (err) {
+        alert("Invalid File");
+      }
+    };
+    reader.readAsText(file);
   };
 
   return (
-    <div className="container mx-auto py-8 max-w-7xl space-y-6">
-      {/* HEADER */}
-      <div className="flex justify-between items-center border-b pb-6">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Full Site Crawler</h1>
-          <p className="text-muted-foreground">Recursively finds all pages and checks for redirects.</p>
-        </div>
-        <div className="flex gap-4 text-sm font-medium">
-          <Badge variant="outline" className="text-slate-600 gap-2">
-            <Globe size={14} /> Visited: {processedCount}
-          </Badge>
-          <Badge variant="outline" className="text-blue-600 gap-2">
-            <Loader2 size={14} className={isCrawling ? "animate-spin" : ""} /> Queue: {queue.length}
-          </Badge>
-          <Badge variant="destructive" className="gap-2">
-            <Bug size={14} /> Broken: {brokenLinks.length}
-          </Badge>
-        </div>
-      </div>
-
-      {/* CONTROLS */}
-      <Card className="bg-slate-50 border-slate-200">
-        <CardHeader>
-          <CardTitle className="text-lg flex items-center gap-2">Configuration</CardTitle>
-        </CardHeader>
-        <CardContent className="flex gap-4 items-end">
-          <div className="grid w-full gap-1.5">
-            <label className="text-sm font-medium">Start URL</label>
-            <Input value={startUrl} onChange={(e) => setStartUrl(e.target.value)} disabled={isCrawling} />
-          </div>
-          <div className="grid w-40 gap-1.5">
-            <label className="text-sm font-medium">Max Pages</label>
-            <Input type="number" value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value))} disabled={isCrawling} />
-          </div>
-          <div className="flex gap-2">
-            {!isCrawling ? (
-              <Button onClick={startCrawl} className="w-32 bg-blue-600 hover:bg-blue-700">
-                <Play className="w-4 h-4 mr-2" /> Start
-              </Button>
-            ) : (
-              <Button onClick={stopCrawl} variant="destructive" className="w-32">
-                <StopCircle className="w-4 h-4 mr-2" /> Stop
-              </Button>
-            )}
-            <Button
-              variant="outline"
-              onClick={() => {
-                resultsRef.current = new Map();
-                setResultsMap(new Map());
-                setQueue([]);
-                setProcessedCount(0);
-              }}
-            >
-              <Trash2 className="w-4 h-4" />
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* PROGRESS */}
-      {isCrawling && (
-        <Card className="bg-blue-50/50 border-blue-100">
-          <CardContent className="pt-6">
-            <div className="flex justify-between text-xs font-medium text-slate-500 mb-2">
-              <span>Crawling Queue...</span>
-              <span>{queue.length} remaining</span>
+    <div className="min-h-screen bg-slate-100 p-6 font-sans text-slate-900">
+      <div className="max-w-[1600px] mx-auto space-y-6">
+        {/* Header */}
+        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-wrap justify-between items-center gap-4">
+          <div className="flex items-center gap-4">
+            <div className="h-10 w-10 bg-blue-100 text-blue-600 rounded-lg flex items-center justify-center font-bold">CO</div>
+            <div>
+              <h1 className="text-lg font-bold text-slate-800">Crawler Dashboard</h1>
+              <div className="flex gap-4 text-xs font-medium text-slate-500">
+                <span>
+                  Queue: <b>{stats.queued}</b>
+                </span>
+                <span>
+                  Scanned: <b className="text-blue-600">{stats.visited}</b>
+                </span>
+                <span className="text-orange-600">
+                  Soft 404: <b>{stats.soft404}</b>
+                </span>
+                <span className="text-red-600">
+                  Broken: <b>{stats.broken}</b>
+                </span>
+              </div>
             </div>
-            <Progress value={isCrawling ? undefined : 100} className="h-2 animate-pulse" />
-          </CardContent>
-        </Card>
-      )}
+          </div>
 
-      {/* BROKEN LINKS SECTION */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* LEFT: Live Log */}
-        <Card className="lg:col-span-2 h-[600px] flex flex-col">
-          <CardHeader className="pb-3">
-            <CardTitle>Live Crawl Log</CardTitle>
-          </CardHeader>
-          <CardContent className="flex-1 overflow-auto p-0">
-            <Table>
-              <TableHeader className="sticky top-0 bg-white z-10">
-                <TableRow>
-                  <TableHead className="w-[70%]">URL</TableHead>
-                  <TableHead>Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {/* Show last 50 processed items from STATE MAP */}
-                {Array.from(resultsMap.values())
-                  .slice(-50)
-                  .reverse()
-                  .map((row) => (
-                    <TableRow key={row.url}>
-                      <TableCell className="font-mono text-xs">
-                        <div className="truncate max-w-[400px]" title={row.url}>
-                          {row.url}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        {row.status === "queued" && (
-                          <Badge variant="secondary" className="text-[10px]">
-                            Queue
-                          </Badge>
-                        )}
-                        {row.status === "crawling" && <Badge className="bg-blue-500 text-[10px]">Scanning</Badge>}
-                        {row.status === "checked" && <Badge className="bg-green-600 text-[10px]">OK</Badge>}
-                        {row.status === "broken" && (
-                          <Badge variant="destructive" className="text-[10px]">
-                            Broken
-                          </Badge>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
+          <div className="flex gap-2">
+            <label className="btn-secondary">
+              <Upload size={14} /> Load
+              <input type="file" onChange={loadProgress} className="hidden" accept=".json" />
+            </label>
+            <button onClick={saveProgress} className="btn-secondary">
+              <Save size={14} /> Save
+            </button>
+            <button onClick={downloadReport} className="btn-secondary text-blue-600 bg-blue-50 border-blue-200">
+              <Download size={14} /> Download JSON
+            </button>
+            <div className="w-px h-8 bg-slate-200 mx-1"></div>
+            <button
+              onClick={() => setIsRunning(!isRunning)}
+              className={`px-5 py-2 rounded-lg font-bold text-white flex items-center gap-2 transition ${
+                isRunning ? "bg-amber-500" : "bg-emerald-600"
+              }`}
+            >
+              {isRunning ? (
+                <>
+                  <Pause size={16} /> PAUSE
+                </>
+              ) : (
+                <>
+                  <Play size={16} /> START
+                </>
+              )}
+            </button>
+          </div>
+        </div>
 
-        {/* RIGHT: Broken Links List */}
-        <Card className="h-[600px] flex flex-col border-red-200 shadow-md">
-          <CardHeader className="bg-red-50 border-b border-red-100 pb-3">
-            <CardTitle className="text-red-800 text-lg flex justify-between items-center">
-              <span>Issues ({brokenLinks.length})</span>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 bg-white text-red-700 border-red-200"
-                onClick={handleCopyFullDetails} // 👈 UPDATED HANDLER HERE
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-[700px]">
+          {/* Live Activity (Small Side Column) */}
+          <div className="lg:col-span-1 bg-slate-900 text-slate-300 rounded-xl overflow-hidden flex flex-col shadow-lg">
+            <div className="p-3 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
+              <h3 className="font-bold text-white text-sm flex items-center gap-2">
+                <Activity size={14} /> Live Feed
+              </h3>
+              <span className="text-[10px] bg-slate-700 px-2 py-0.5 rounded text-emerald-400">{activeWorkers} Active</span>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {liveFeed.map((item, i) => (
+                <div key={i} className="text-xs border-b border-slate-700/50 pb-2 mb-2 last:border-0">
+                  <div className="flex justify-between mb-1">
+                    <StatusBadge status={item.status} />
+                    <span className="text-slate-500">{item.foundCount} links</span>
+                  </div>
+                  <div className="whitespace-break-spaces text-slate-400 font-mono" title={item.url}>
+                    {item.url}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Broken Links Report (Main Wide Area) */}
+          <div className="lg:col-span-3 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col">
+            <div className="p-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+              <h3 className="font-bold text-slate-700 text-sm flex items-center gap-2">
+                <AlertTriangle size={16} className="text-red-500" /> Broken Links Detected
+              </h3>
+              <button
+                onClick={() => {
+                  brokenLinks.current = [];
+                  setStats((s) => ({ ...s, broken: 0, soft404: 0 }));
+                }}
+                className="text-xs text-red-500 flex items-center gap-1 hover:bg-red-50 px-2 py-1 rounded"
               >
-                <Copy className="w-3 h-3 mr-2" /> Copy Full Report
-              </Button>
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="flex-1 overflow-auto pt-4 space-y-4">
-            {brokenLinks.length === 0 && (
-              <div className="text-center text-slate-400 text-sm mt-20">
-                <CheckCircle2 size={48} className="mx-auto mb-2 opacity-20" />
-                <p>No broken links found yet.</p>
-              </div>
-            )}
-            {brokenLinks.map((link) => (
-              <div key={link.url} className="bg-red-50 p-3 rounded border border-red-100 text-xs break-all">
-                <div className="font-bold text-red-700 mb-1 flex items-center gap-1">
-                  <AlertTriangle size={12} /> Broken / Redirect
-                </div>
-                <div className="text-slate-600 mb-2">{link.url}</div>
-                <div className="text-[10px] text-slate-400">
-                  Found on: <span className="underline">{link.source}</span>
-                </div>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
+                <Trash2 size={12} /> Clear List
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-0 max-h-[600px]">
+              <table className="w-full text-left border-collapse">
+                <thead className="bg-slate-100 text-slate-500 text-xs uppercase sticky top-0 z-10 shadow-sm">
+                  <tr>
+                    <th className="p-3 font-semibold w-24">Status</th>
+                    <th className="p-3 font-semibold w-1/3">Broken Link</th>
+                    <th className="p-3 font-semibold w-1/4">Redirected To</th>
+                    <th className="p-3 font-semibold">Found On Page</th>
+                  </tr>
+                </thead>
+                <tbody className="text-sm divide-y divide-slate-100">
+                  {brokenLinks.current.map((item, i) => (
+                    <tr key={i} className="hover:bg-slate-50 group transition-colors">
+                      <td className="p-3">
+                        <StatusBadge status={item.status} />
+                      </td>
+                      <td className="p-3 font-mono text-red-600 text-xs break-all pr-4">
+                        <a href={item.brokenLink} target="_blank" className="hover:underline flex gap-1 items-center">
+                          {item.brokenLink}
+                        </a>
+                      </td>
+                      <td className="p-3 text-xs text-slate-500 break-all pr-4">
+                        {item.redirectedTo ? (
+                          <a href={item.redirectedTo} target="_blank" className="text-blue-600 hover:underline">
+                            {item.redirectedTo}
+                          </a>
+                        ) : (
+                          <span className="opacity-30">-</span>
+                        )}
+                      </td>
+                      <td className="p-3 text-xs text-slate-500 break-all">
+                        <a href={item.foundOnPage} target="_blank" className="hover:text-slate-800 hover:underline flex items-center gap-1">
+                          {item.foundOnPage}
+                        </a>
+                      </td>
+                    </tr>
+                  ))}
+                  {brokenLinks.current.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="p-10 text-center text-slate-400 italic">
+                        No broken links found yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
+
+// Helper Components
+function StatusBadge({ status }: { status: string }) {
+  if (status === "ok") return <span className="text-emerald-500 font-bold text-[10px]">OK</span>;
+  if (status === "redirect") return <span className="text-blue-500 font-bold text-[10px]">REDIRECT</span>;
+  if (status === "soft-404")
+    return <span className="bg-orange-100 text-orange-700 px-2 py-0.5 rounded text-[10px] font-bold border border-orange-200">SOFT 404</span>;
+  return <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded text-[10px] font-bold border border-red-200">BROKEN</span>;
+}
+
+const btnSecondary =
+  "flex items-center gap-2 px-3 py-2 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 text-xs font-medium text-slate-700 transition cursor-pointer";
